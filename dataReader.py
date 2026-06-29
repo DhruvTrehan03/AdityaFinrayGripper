@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--csv_file",
-        default="RawData/Press_1027/2026-06-09_18-29-11_testing.csv",
+        default="RawData/Press_1027/2026-06-12_12-59-23_6Forces_40x10.csv",
         help="Path to CSV file.",
     )
 
