@@ -1,6 +1,7 @@
 import argparse
 import re
 import sys
+from collections import defaultdict
 
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
@@ -41,6 +42,18 @@ def parse_args() -> argparse.Namespace:
         help="Only display signals with actual_force_N <= max_force.",
     )
 
+    parser.add_argument(
+        "--no_pair_average",
+        action="store_true",
+        help="Keep the original eit_n columns instead of averaging duplicate electrode pairs.",
+    )
+
+    parser.add_argument(
+        "--condensed_csv_file",
+        default=None,
+        help="Optional path to write the pair-averaged CSV.",
+    )
+
     return parser.parse_args()
 
 
@@ -74,9 +87,87 @@ def sort_rows_by_xy_then_force(
     )
 
 
-def load_data(csv_file):
+def build_channel_pair_map(num_electrodes=NUM_ELECTRODES):
+    protocol_obj = protocol.create(
+        num_electrodes,
+        dist_exc=1,
+        step_meas=1,
+        parser_meas="rotate_meas",
+    )
+
+    channel_pairs = []
+    for meas_pairs in protocol_obj.meas_mat:
+        for m, n in meas_pairs:
+            pair = tuple(sorted((int(m) + 1, int(n) + 1)))
+            channel_pairs.append(pair)
+
+    return channel_pairs
+
+
+def pair_sort_key(pair):
+    a, b = pair
+    if a == 1 and b == NUM_ELECTRODES:
+        return (NUM_ELECTRODES, b)
+    return (a, b)
+
+
+def condense_duplicate_pair_columns(df, eit_columns, channel_pairs):
+    if len(eit_columns) != len(channel_pairs):
+        print(
+            "Pair averaging skipped: "
+            f"{len(eit_columns)} EIT columns do not match "
+            f"{len(channel_pairs)} protocol channels."
+        )
+        return df, eit_columns, None
+
+    pair_to_columns = defaultdict(list)
+    for col, pair in zip(eit_columns, channel_pairs):
+        pair_to_columns[pair].append(col)
+
+    unique_pairs = sorted(pair_to_columns, key=pair_sort_key)
+    condensed = df.drop(columns=eit_columns).copy()
+
+    insert_at = min(df.columns.get_loc(col) for col in eit_columns)
+    averaged_columns = []
+    pair_labels = {}
+    for idx, pair in enumerate(unique_pairs):
+        new_col = f"eit_{idx}"
+        source_cols = pair_to_columns[pair]
+        averaged_columns.append(new_col)
+        pair_labels[new_col] = pair
+        condensed.insert(
+            insert_at + idx,
+            new_col,
+            df[source_cols].astype(float).mean(axis=1),
+        )
+
+    print(
+        "Averaged duplicate EIT pair columns: "
+        f"{len(eit_columns)} raw channels -> {len(averaged_columns)} unique pairs."
+    )
+    for col in averaged_columns:
+        pair = pair_labels[col]
+        print(f"{col}: pair=({pair[0]}, {pair[1]}) from {len(pair_to_columns[pair])} channels")
+
+    return condensed, averaged_columns, pair_labels
+
+
+def load_data(csv_file, average_duplicate_pairs=True, condensed_csv_file=None):
     df = pd.read_csv(csv_file)
     eit_columns = find_eit_columns(df.columns)
+    pair_labels = None
+
+    if average_duplicate_pairs:
+        channel_pairs = build_channel_pair_map()
+        df, eit_columns, pair_labels = condense_duplicate_pair_columns(
+            df,
+            eit_columns,
+            channel_pairs,
+        )
+
+    if condensed_csv_file:
+        df.to_csv(condensed_csv_file, index=False)
+        print(f"Pair-averaged CSV written to {condensed_csv_file}")
 
     # Global baseline: first row of the CSV (before any per-location sorting)
     global_baseline = df.iloc[0][eit_columns].astype(float).values
@@ -86,7 +177,7 @@ def load_data(csv_file):
     print("Rows sorted by target_x_mm, target_y_mm, actual_force_N.")
     eit_columns = find_eit_columns(df.columns)
 
-    return df, eit_columns, global_baseline
+    return df, eit_columns, global_baseline, pair_labels
 
 
 def build_location_index(df):
@@ -133,6 +224,21 @@ def setup_eit_solver():
     return mesh_obj, protocol_obj, solver
 
 
+def print_protocol_pair_summary(channel_pairs):
+    pair_to_channels = defaultdict(list)
+    for channel, pair in enumerate(channel_pairs):
+        pair_to_channels[pair].append(channel)
+
+    print("Unique read pairs in protocol:")
+    for pair in sorted(pair_to_channels, key=pair_sort_key):
+        channels = pair_to_channels[pair]
+        print(
+            f"pair=({pair[0]}, {pair[1]}): "
+            f"{len(channels)} channels "
+            f"(eit_{channels[0]}..eit_{channels[-1]})"
+        )
+
+
 def field_to_face(values, pts, tri):
     """Convert node-based or element-based field to per-face values."""
     n_pts = pts.shape[0]
@@ -151,8 +257,15 @@ def field_to_face(values, pts, tri):
 def main():
     args = parse_args()
 
+    channel_pairs = build_channel_pair_map()
+    print_protocol_pair_summary(channel_pairs)
+
     try:
-        df, eit_columns, global_baseline = load_data(args.csv_file)
+        df, eit_columns, global_baseline, pair_labels = load_data(
+            args.csv_file,
+            average_duplicate_pairs=not args.no_pair_average,
+            condensed_csv_file=args.condensed_csv_file,
+        )
     except Exception as exc:
         print(f"Error loading CSV: {exc}", file=sys.stderr)
         return 1
@@ -171,6 +284,12 @@ def main():
     channel_indices = [
         int(re.search(r"(\d+)$", col).group(1))
         for col in eit_columns
+    ]
+    channel_labels = [
+        f"{pair_labels[col][0]}-{pair_labels[col][1]}"
+        if pair_labels and col in pair_labels
+        else str(channel)
+        for channel, col in zip(channel_indices, eit_columns)
     ]
 
     # --- EIT solver setup ---
@@ -258,6 +377,8 @@ def main():
             ax.set_ylim(global_min - pad, global_max + pad)
             ax.set_xlabel("EIT Channel")
             ax.set_ylabel("Signal (baseline-subtracted)")
+            ax.set_xticks(channel_indices)
+            ax.set_xticklabels(channel_labels, rotation=45, ha="right")
             ax.grid(True, alpha=0.3)
             ax.legend(
                 title="Force",
@@ -293,6 +414,20 @@ def main():
                 transform=recon_ax.transAxes, fontsize=12,
             )
         else:
+            expected_measurements = sum(len(group) for group in protocol_obj.meas_mat)
+            if len(signals[0][1]) != expected_measurements:
+                recon_ax.text(
+                    0.5, 0.5,
+                    "Reconstruction needs the full protocol channel count.\n"
+                    f"Loaded {len(signals[0][1])} averaged pair channels; "
+                    f"solver expects {expected_measurements}.",
+                    ha="center", va="center",
+                    transform=recon_ax.transAxes, fontsize=12,
+                )
+                recon_ax.set_title("Reconstruction unavailable for pair-averaged data")
+                fig.canvas.draw_idle()
+                return
+
             # Average all signals at this location into one reconstruction
             all_frames = np.array([v for _, v in signals])
             mean_frame = np.mean(all_frames, axis=0)

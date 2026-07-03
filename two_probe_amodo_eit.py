@@ -3,7 +3,6 @@ import threading
 import time
 
 import numpy as np
-import pyeit.eit.protocol as protocol
 
 import amodo_eit as eit
 from utils import print_info
@@ -11,8 +10,6 @@ from utils import print_info
 
 # Defaults match the current logger configuration.
 NUM_ELECTRODES = 16
-INJ_STEP = 1
-READ_STEP = 1
 STIM_FREQ_KHZ = 50
 PERIODS_PER_MEASUREMENT = 50
 TX_GAIN = 32
@@ -23,8 +20,8 @@ class TwoProbeAmodoEITDevice(threading.Thread):
     """Amodo EIT reader that uses two-probe configurations only.
 
     Each configuration injects current through the same two electrodes used for
-    voltage measurement: (A, B, M, N) = (A, B, A, B). The A-B spacing follows
-    the same electrode spacing used by the current logger defaults.
+    voltage measurement: (A, B, M, N) = (A, B, A, B). The pair list covers
+    every odd-numbered electrode paired with every even-numbered electrode.
     """
 
     def __init__(
@@ -32,7 +29,6 @@ class TwoProbeAmodoEITDevice(threading.Thread):
         q_out,
         group=None,
         num_electrodes=NUM_ELECTRODES,
-        electrode_spacing=INJ_STEP,
         stim_freq_khz=STIM_FREQ_KHZ,
         periods_per_measurement=PERIODS_PER_MEASUREMENT,
         tx_gain=TX_GAIN,
@@ -50,34 +46,29 @@ class TwoProbeAmodoEITDevice(threading.Thread):
         self.device = self.devices[0]
 
         self.num_electrodes = num_electrodes
-        self.electrode_spacing = electrode_spacing
         self.stim_freq_khz = stim_freq_khz
         self.periods_per_measurement = periods_per_measurement
         self.tx_gain = tx_gain
         self.rx_gain = rx_gain
 
-        self.protocol_obj = protocol.create(
-            self.num_electrodes,
-            dist_exc=self.electrode_spacing,
-            step_meas=READ_STEP,
-            parser_meas="rotate_meas",
-        )
         self.baseline_frame = None
         self.baseline_clipping = None
 
     def _build_two_probe_configurations(self):
         electrode_configurations = []
-        pin_offset = 1
-        for A, B in self.protocol_obj.ex_mat:
-            configuration = (
-                A + pin_offset,
-                B + pin_offset,
-                A + pin_offset,
-                B + pin_offset,
-                self.tx_gain,
-                self.rx_gain,
-            )
-            electrode_configurations.append(configuration)
+        odd_electrodes = range(1, self.num_electrodes + 1, 2)
+        even_electrodes = range(2, self.num_electrodes + 1, 2)
+        for A in odd_electrodes:
+            for B in even_electrodes:
+                configuration = (
+                    A,
+                    B,
+                    A,
+                    B,
+                    self.tx_gain,
+                    self.rx_gain,
+                )
+                electrode_configurations.append(configuration)
         return electrode_configurations
 
     def _configure_and_start_streaming(self):
