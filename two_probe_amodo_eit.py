@@ -11,8 +11,8 @@ from utils import print_info
 # Defaults match the current logger configuration.
 NUM_ELECTRODES = 16
 STIM_FREQ_KHZ = 50
-PERIODS_PER_MEASUREMENT = 50
-TX_GAIN = 32
+PERIODS_PER_MEASUREMENT = 10
+TX_GAIN = 16
 RX_GAIN = 2
 
 
@@ -61,10 +61,10 @@ class TwoProbeAmodoEITDevice(threading.Thread):
         for A in odd_electrodes:
             for B in even_electrodes:
                 configuration = (
-                    A,
                     B,
                     A,
                     B,
+                    A,
                     self.tx_gain,
                     self.rx_gain,
                 )

@@ -9,7 +9,7 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 
 import numpy as np
 import serial
-from vispy import app, scene
+from vispy import app, color, scene
 
 from two_probe_amodo_eit import NUM_ELECTRODES, TwoProbeAmodoEITDevice
 from utils import print_error, print_info, print_warning
@@ -17,6 +17,9 @@ from utils import print_error, print_info, print_warning
 
 APP_NAME = "Two-Probe Amodo Taxel Live View"
 EPS = 1e-12
+TRAPEZIUM_LEFT_HEIGHT = 20.0
+TRAPEZIUM_RIGHT_HEIGHT = 15.0
+TRAPEZIUM_WIDTH = 60.0
 
 
 class MockTwoProbeSource(threading.Thread):
@@ -102,9 +105,159 @@ def readings_to_grid(readings, num_electrodes):
     return values.reshape(len(odd_electrodes), len(even_electrodes))
 
 
-def display_grid(frame_grid, baseline_grid, mode):
+def render_grid(grid):
+    return np.flipud(grid)
+
+
+def taxel_layout_description(num_electrodes):
+    cols = num_electrodes // 2
+    return (
+        "trapezium left height 20, right height 15, center aligned; "
+        f"display columns 1-{cols}"
+    )
+
+
+def trapezium_vertices(
+    rows,
+    cols,
+    left_height=TRAPEZIUM_LEFT_HEIGHT,
+    right_height=TRAPEZIUM_RIGHT_HEIGHT,
+    width=TRAPEZIUM_WIDTH,
+):
+    vertices = []
+    for col_index in range(cols + 1):
+        t = col_index / cols if cols else 0.0
+        height = left_height + (right_height - left_height) * t
+        bottom = -0.5 * height
+        top = 0.5 * height
+        x = width * t
+        for row_index in range(rows + 1):
+            y = bottom + height * row_index / rows if rows else 0.0
+            vertices.append((float(x), float(y), 0.0))
+    return np.asarray(vertices, dtype=np.float32)
+
+
+def trapezium_faces(rows, cols):
+    faces = []
+    for col_index in range(cols):
+        for row_index in range(rows):
+            lower_left = col_index * (rows + 1) + row_index
+            upper_left = lower_left + 1
+            lower_right = (col_index + 1) * (rows + 1) + row_index
+            upper_right = lower_right + 1
+            faces.append((lower_left, lower_right, upper_right))
+            faces.append((lower_left, upper_right, upper_left))
+    return np.asarray(faces, dtype=np.uint32)
+
+
+def trapezium_grid_lines(
+    rows,
+    cols,
+    left_height=TRAPEZIUM_LEFT_HEIGHT,
+    right_height=TRAPEZIUM_RIGHT_HEIGHT,
+    width=TRAPEZIUM_WIDTH,
+):
+    segments = []
+    for col_index in range(cols + 1):
+        t = col_index / cols if cols else 0.0
+        height = left_height + (right_height - left_height) * t
+        bottom = -0.5 * height
+        top = 0.5 * height
+        x = width * t
+        segments.extend([(float(x), bottom, 0.01), (float(x), top, 0.01)])
+
+    for row_index in range(rows + 1):
+        line = []
+        for col_index in range(cols + 1):
+            t = col_index / cols if cols else 0.0
+            height = left_height + (right_height - left_height) * t
+            bottom = -0.5 * height
+            y = bottom + height * row_index / rows if rows else 0.0
+            line.append((float(width * t), float(y), 0.01))
+        for start, end in zip(line, line[1:]):
+            segments.extend([start, end])
+    return np.asarray(segments, dtype=np.float32)
+
+
+def grid_face_colors(grid, cmap, clim):
+    vmin, vmax = clim
+    span = max(vmax - vmin, EPS)
+    values = np.asarray(grid, dtype=float).T.reshape(-1)
+    normalized = np.clip((values - vmin) / span, 0.0, 1.0)
+    normalized[~np.isfinite(values)] = 0.0
+    colors = cmap.map(normalized)
+    colors[~np.isfinite(values), 3] = 0.0
+    return np.repeat(colors, 2, axis=0)
+
+
+def active_column_winners(grid, threshold=0.35, max_columns=3):
+    finite_grid = np.where(np.isfinite(grid), grid, -np.inf)
+    global_peak = float(np.nanmax(finite_grid))
+    if global_peak <= 0.0:
+        return []
+
+    column_peaks = np.nanmax(finite_grid, axis=0)
+    active_columns = [
+        col
+        for col, peak in enumerate(column_peaks)
+        if np.isfinite(peak) and peak > 0.0 and peak >= global_peak * threshold
+    ]
+    active_columns.sort(key=lambda col: column_peaks[col], reverse=True)
+    if max_columns > 0:
+        active_columns = active_columns[:max_columns]
+
+    winners = []
+    for col in active_columns:
+        row = int(np.nanargmax(finite_grid[:, col]))
+        winners.append((row, col))
+    return winners
+
+
+def attenuate_active_columns(grid, winners, row_factor=1.0, col_factor=1.0):
+    shaped = grid.copy()
+    preserved = {
+        (row_index, col_index): shaped[row_index, col_index]
+        for row_index, col_index in winners
+    }
+
+    if row_factor > 1.0:
+        for row_index, _ in winners:
+            shaped[row_index, :] /= row_factor
+    if col_factor > 1.0:
+        for _, col_index in winners:
+            shaped[:, col_index] /= col_factor
+
+    for (row_index, col_index), value in preserved.items():
+        shaped[row_index, col_index] = value
+    return shaped
+
+
+def display_grid(
+    frame_grid,
+    baseline_grid,
+    mode,
+    row_sensitivity=1.0,
+    column_sensitivity=6.0,
+    column_active_threshold=0.35,
+    max_dampened_columns=3,
+):
     if mode == "raw":
         return frame_grid
+    if mode == "max-decrease":
+        decrease = baseline_grid - frame_grid
+        winners = active_column_winners(
+            decrease,
+            threshold=column_active_threshold,
+            max_columns=max_dampened_columns,
+        )
+        if winners:
+            return attenuate_active_columns(
+                decrease,
+                winners,
+                row_factor=row_sensitivity,
+                col_factor=column_sensitivity,
+            )
+        return decrease
     if mode == "delta":
         return frame_grid - baseline_grid
     if mode == "percent":
@@ -128,7 +281,7 @@ def drain_latest(q_in):
 def color_limits(grid, symmetric):
     finite = grid[np.isfinite(grid)]
     if finite.size == 0:
-        return (-1.0, 1.0) if symmetric else (0.0, 1.0)
+        return (-2.0, 2.0) if symmetric else (0.0, 1.0)
 
     if symmetric:
         limit = float(np.nanpercentile(np.abs(finite), 98))
@@ -138,15 +291,31 @@ def color_limits(grid, symmetric):
 
     vmin = float(np.nanpercentile(finite, 2))
     vmax = float(np.nanpercentile(finite, 98))
+    if vmin >= 0.0:
+        vmin = 0.0
     if abs(vmax - vmin) <= EPS:
         pad = max(abs(vmax) * 0.05, 1.0)
-        vmin -= pad
         vmax += pad
     return vmin, vmax
 
 
-def set_image_clim(image, cbar, clim):
-    image.clim = clim
+def initial_color_limits(args, grid, symmetric):
+    if args.scale_limit is not None:
+        limit = abs(float(args.scale_limit))
+        if limit <= EPS:
+            raise ValueError("--scale-limit must be greater than zero.")
+        return (-limit, limit) if symmetric else (0.0, limit)
+    return color_limits(grid, symmetric)
+
+
+def set_heatmap_data(mesh, cbar, grid, cmap, clim):
+    rows, cols = grid.shape
+    mesh.set_data(
+        vertices=trapezium_vertices(rows, cols),
+        faces=trapezium_faces(rows, cols),
+        face_colors=grid_face_colors(grid, cmap, clim),
+        color=(1.0, 1.0, 1.0, 1.0),
+    )
     cbar.clim = clim
 
 
@@ -166,7 +335,7 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=("percent", "abs-percent", "delta", "raw"),
+        choices=("percent", "abs-percent", "delta", "raw", "max-decrease"),
         default="percent",
         help="Quantity shown in the heatmap.",
     )
@@ -176,12 +345,67 @@ def main():
         help="Keep the initial color scale instead of adapting it to incoming frames.",
     )
     parser.add_argument(
+        "--scale-limit",
+        type=float,
+        default=None,
+        help=(
+            "Use an absolute heatmap color scale. Percent/delta modes use +/- this "
+            "value; abs-percent/raw modes use 0 to this value. Also implies --fixed-scale."
+        ),
+    )
+    parser.add_argument(
+        "--row-sensitivity",
+        type=float,
+        default=1.0,
+        help=(
+            "In max-decrease mode, divide the rest of the winning row by this factor "
+            "while preserving the winning taxel. Use values >1 to stop a whole row "
+            "from lighting up."
+        ),
+    )
+    parser.add_argument(
+        "--column-sensitivity",
+        type=float,
+        default=6.0,
+        help=(
+            "In max-decrease mode, divide the rest of the winning column by this factor "
+            "while preserving the winning taxel."
+        ),
+    )
+    parser.add_argument(
+        "--column-active-threshold",
+        type=float,
+        default=0.35,
+        help=(
+            "In max-decrease mode, also dampen columns whose strongest taxel is at "
+            "least this fraction of the strongest touch. Prevents weak columns/noise "
+            "from being dampened."
+        ),
+    )
+    parser.add_argument(
+        "--max-dampened-columns",
+        type=int,
+        default=3,
+        help=(
+            "Maximum number of active columns to dampen in max-decrease mode. "
+            "Use 0 for no cap."
+        ),
+    )
+    parser.add_argument(
         "--num-electrodes",
         type=int,
         default=NUM_ELECTRODES,
         help="Number of electrodes in the two-probe configuration.",
     )
     args = parser.parse_args()
+    if args.row_sensitivity < 1.0:
+        parser.error("--row-sensitivity must be >= 1.0")
+    if args.column_sensitivity < 1.0:
+        parser.error("--column-sensitivity must be >= 1.0")
+    if not 0.0 < args.column_active_threshold <= 1.0:
+        parser.error("--column-active-threshold must be > 0 and <= 1")
+    if args.max_dampened_columns < 0:
+        parser.error("--max-dampened-columns must be >= 0")
 
     q_eit = queue.Queue(maxsize=4)
     reader = make_source(args, q_eit)
@@ -198,7 +422,15 @@ def main():
     n_measurements = len(pair_labels)
     baseline_frame = safe_frame(baseline_sample["readings"])
     baseline_grid = readings_to_grid(baseline_frame, args.num_electrodes)
-    plot_grid = display_grid(baseline_grid, baseline_grid, args.mode)
+    plot_grid = render_grid(display_grid(
+        baseline_grid,
+        baseline_grid,
+        args.mode,
+        row_sensitivity=args.row_sensitivity,
+        column_sensitivity=args.column_sensitivity,
+        column_active_threshold=args.column_active_threshold,
+        max_dampened_columns=args.max_dampened_columns,
+    ))
     symmetric = args.mode in ("percent", "delta")
     cmap = "diverging" if symmetric else "viridis"
 
@@ -221,16 +453,28 @@ def main():
     heatmap_grid.spacing = 0
     heatmap_view = heatmap_grid.add_view(row=0, col=0)
     heatmap_view.camera = "panzoom"
+    rows, cols = plot_grid.shape
     heatmap_view.camera.set_range(
-        x=(-0.5, len(even_electrodes) - 0.5),
-        y=(-0.5, len(odd_electrodes) - 0.5),
+        x=(0.0, TRAPEZIUM_WIDTH),
+        y=(-TRAPEZIUM_LEFT_HEIGHT * 0.55, TRAPEZIUM_LEFT_HEIGHT * 0.55),
     )
     heatmap_view.camera.aspect = 1.0
 
-    image = scene.visuals.Image(
-        plot_grid,
-        cmap=cmap,
-        clim=color_limits(plot_grid, symmetric),
+    clim = initial_color_limits(args, plot_grid, symmetric)
+    color_map = color.get_colormap(cmap)
+    mesh = scene.visuals.Mesh(
+        vertices=trapezium_vertices(rows, cols),
+        faces=trapezium_faces(rows, cols),
+        face_colors=grid_face_colors(plot_grid, color_map, clim),
+        color=(1.0, 1.0, 1.0, 1.0),
+        parent=heatmap_view.scene,
+    )
+    mesh.set_gl_state(depth_test=False, cull_face=False)
+    scene.visuals.Line(
+        pos=trapezium_grid_lines(rows, cols),
+        color=(0.85, 0.85, 0.85, 0.55),
+        width=1.0,
+        connect="segments",
         parent=heatmap_view.scene,
     )
 
@@ -241,7 +485,7 @@ def main():
         label_color="white",
         padding=(0.05, 0.3),
     )
-    cbar.clim = image.clim
+    cbar.clim = clim
     for tick in cbar.ticks:
         tick.font_size = 8
     heatmap_grid.add_widget(cbar, row=0, col=1)
@@ -269,7 +513,7 @@ def main():
     )
 
     title = scene.Label(
-        f"{APP_NAME} | rows odd A/M {odd_electrodes} | cols even B/N {even_electrodes}",
+        f"{APP_NAME} | {taxel_layout_description(args.num_electrodes)}",
         color="white",
         font_size=10,
         anchor_x="left",
@@ -326,16 +570,28 @@ def main():
         state["last_sample"] = sample
         frame = safe_frame(sample["readings"])
         frame_grid = readings_to_grid(frame, args.num_electrodes)
-        plot_grid_now = display_grid(frame_grid, state["baseline_grid"], args.mode)
+        plot_grid_now = render_grid(display_grid(
+            frame_grid,
+            state["baseline_grid"],
+            args.mode,
+            row_sensitivity=args.row_sensitivity,
+            column_sensitivity=args.column_sensitivity,
+            column_active_threshold=args.column_active_threshold,
+            max_dampened_columns=args.max_dampened_columns,
+        ))
 
-        image.set_data(plot_grid_now)
-        if not args.fixed_scale:
-            set_image_clim(image, cbar, color_limits(plot_grid_now, symmetric))
+        clim_now = cbar.clim
+        if args.scale_limit is None and not args.fixed_scale:
+            clim_now = color_limits(plot_grid_now, symmetric)
+        set_heatmap_data(mesh, cbar, plot_grid_now, color_map, clim_now)
 
         line_pos = np.column_stack((line_x, frame))
         line_plot.set_data(pos=line_pos)
         y_min = float(np.nanmin(frame))
         y_max = float(np.nanmax(frame))
+        # y_min = 0.05
+        # y_max = 0.08
+
         y_range = max(y_max - y_min, EPS)
         line_view.camera.aspect = None
         line_view.camera.set_range(
